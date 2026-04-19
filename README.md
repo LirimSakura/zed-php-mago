@@ -1,2 +1,1 @@
-# zed-php-mago
-Mago for Zed
+# Language Server for Mago, for Zed Editor.
