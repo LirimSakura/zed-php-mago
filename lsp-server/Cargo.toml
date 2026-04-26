@@ -2,6 +2,7 @@
 name = "mago-lsp-server"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [[bin]]
 name = "mago-lsp-server"
@@ -19,6 +20,3 @@ url = "2.0"
 uuid = { version = "1.0", features = ["v4"] }
 sha2 = "0.10"
 lz4_flex = "0.11"
-
-[dev-dependencies]
-tokio-test = "0.4"

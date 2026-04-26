@@ -245,6 +245,7 @@ impl MagoLanguageServer {
         uri: &Url,
         file_path: &str,
         command: &str,
+        content: &String,
         temp_file_name: &str,
         temp_file_path: &PathBuf,
     ) -> Result<Vec<Diagnostic>> {
@@ -402,7 +403,7 @@ impl MagoLanguageServer {
 
         // Extract JSON from raw output (Mago might output debug info before JSON)
         let json_output = self.extract_json_from_output(&raw_output);
-        let diagnostics = self.parse_mago_output(&json_output, uri).await?;
+        let diagnostics = self.parse_mago_output(&content, &json_output, uri).await?;
 
         // Log results with timing
         let total_time = start_time.elapsed();
@@ -496,7 +497,12 @@ impl MagoLanguageServer {
         output.to_string()
     }
 
-    async fn parse_mago_output(&self, json_output: &str, uri: &Url) -> Result<Vec<Diagnostic>> {
+    async fn parse_mago_output(
+        &self,
+        content: &String,
+        json_output: &str,
+        uri: &Url,
+    ) -> Result<Vec<Diagnostic>> {
         // Early return if empty output
         if json_output.trim().is_empty() {
             return Ok(vec![]);
@@ -536,7 +542,10 @@ impl MagoLanguageServer {
             eprintln!("🔍 Mago LSP: {} issues", issues.len());
 
             for (issue_idx, issue_entry) in issues.iter().enumerate() {
-                if let Some(diagnostic) = self.convert_issue_to_diagnostic(issue_entry, uri).await {
+                if let Some(diagnostic) = self
+                    .convert_issue_to_diagnostic(content, issue_entry, uri)
+                    .await
+                {
                     diagnostics.push(diagnostic);
                     eprintln!(
                         "✅ Mago LSP: Successfully converted issue #{} to diagnostic for {}",
@@ -565,6 +574,7 @@ impl MagoLanguageServer {
 
     async fn convert_issue_to_diagnostic(
         &self,
+        content: &String,
         issue: &serde_json::Value,
         uri: &Url,
     ) -> Option<Diagnostic> {
@@ -619,10 +629,10 @@ impl MagoLanguageServer {
 
         let annotation = &issue["annotations"][0];
         // let kind = annotation["kind"].as_str().unwrap_or("");
-        let start_offset = annotation["span"]["start"]["offset"].as_u64()? as u32;
-        let start_line = annotation["span"]["start"]["line"].as_u64()? as u32;
-        let end_offset = annotation["span"]["end"]["offset"].as_u64()? as u32;
-        let end_line = annotation["span"]["end"]["line"].as_u64()? as u32;
+        let start_offset = annotation["span"]["start"]["offset"].as_u64()?;
+        //let start_line = annotation["span"]["start"]["line"].as_u64()? as u32;
+        let end_offset = annotation["span"]["end"]["offset"].as_u64()?;
+        //let end_line = annotation["span"]["end"]["line"].as_u64()? as u32;
 
         let severity = match level {
             "Error" => DiagnosticSeverity::ERROR,
@@ -631,17 +641,11 @@ impl MagoLanguageServer {
             _ => DiagnosticSeverity::INFORMATION,
         };
 
-        // Create range with proper boundaries
-        let range = Range {
-            start: Position {
-                line: start_line,
-                character: start_offset,
-            },
-            end: Position {
-                line: end_line,
-                character: end_offset,
-            },
-        };
+        let range = self.calculate_position_to_range(content, start_offset, end_offset);
+
+        let data = serde_json::json!({
+           "edits": issue["edits"],
+        });
 
         Some(Diagnostic {
             range,
@@ -656,8 +660,36 @@ impl MagoLanguageServer {
             related_information: None,
             tags: None,
             code_description: None,
-            data: None,
+            data: Some(data),
         })
+    }
+
+    fn calculate_position_to_range(
+        &self,
+        content: &String,
+        position_start: u64,
+        position_end: u64,
+    ) -> Range {
+        let fn_calculate_position = |content: &String, position: u64| {
+            let before: String = content.chars().take(position as usize).collect();
+            let before_s: Vec<&str> = before.split('\n').collect();
+            let line = if before.len() == 0 {
+                0
+            } else {
+                before_s.len() as u32 - 1
+            };
+            let charcter = before_s.last().unwrap().chars().count() as u32;
+            return Position {
+                line: line,
+                character: charcter,
+            };
+        };
+
+        let range = Range {
+            start: fn_calculate_position(content, position_start),
+            end: fn_calculate_position(content, position_end),
+        };
+        range
     }
 }
 
@@ -764,6 +796,13 @@ impl LanguageServer for MagoLanguageServer {
                     }),
                     file_operations: None,
                 }),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        resolve_provider: Some(false),
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
             },
             ..Default::default()
@@ -1284,10 +1323,22 @@ impl LanguageServer for MagoLanguageServer {
                     );
                     eprintln!("📝 Mago LSP: Wrote {} bytes to temp file", content.len());
 
-                    let lint_feature =
-                        self.run_mago(&uri, path_str, "lint", &temp_file_name, &temp_file_path);
-                    let analyze_feature =
-                        self.run_mago(&uri, path_str, "analyze", &temp_file_name, &temp_file_path);
+                    let lint_feature = self.run_mago(
+                        &uri,
+                        path_str,
+                        "lint",
+                        &content,
+                        &temp_file_name,
+                        &temp_file_path,
+                    );
+                    let analyze_feature = self.run_mago(
+                        &uri,
+                        path_str,
+                        "analyze",
+                        &content,
+                        &temp_file_name,
+                        &temp_file_path,
+                    );
                     // let lint_handle = tokio::spawn(lint_feature);
                     // let analyze_handle = tokio::spawn(analyze_feature);
 
@@ -1382,6 +1433,95 @@ impl LanguageServer for MagoLanguageServer {
                 related_documents: None,
             }),
         ))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> LspResult<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let file_name = uri
+            .path_segments()
+            .and_then(|segments| segments.last())
+            .unwrap_or("unknown");
+
+        // Get the document content first
+        let content = {
+            let docs = self
+                .open_docs
+                .read()
+                .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+
+            if let Some(compressed_doc) = docs.get(&uri) {
+                self.decompress_document(compressed_doc).ok()
+            } else {
+                None
+            }
+        };
+
+        let Some(content) = content else {
+            eprintln!("❌ Mago LSP: No document content for {}", file_name);
+            return Ok(Some(vec![]));
+        };
+
+        if params.context.diagnostics.is_empty() {
+            return Ok(Some(vec![]));
+        }
+        let mut response = CodeActionResponse::new();
+
+        for (_idx, diagnostic) in params.context.diagnostics.iter().enumerate() {
+            let Some(data) = &diagnostic.data else {
+                continue;
+            };
+
+            let Some(new_text) = data["edits"][0][1][0]["new_text"].as_str() else {
+                continue;
+            };
+            let Some(range_start) = data["edits"][0][1][0]["range"]["start"].as_u64() else {
+                continue;
+            };
+            let Some(range_end) = data["edits"][0][1][0]["range"]["end"].as_u64() else {
+                continue;
+            };
+            let range = self.calculate_position_to_range(&content, range_start, range_end);
+            // let range = Range {
+            //     start: Position {
+            //         line: 0,
+            //         character: range_start as u32,
+            //     },
+            //     end: Position {
+            //         line: 0,
+            //         character: range_end as u32,
+            //     },
+            // };
+            let text_edit = TextEdit {
+                range: range,
+                new_text: new_text.to_string(),
+            };
+            let mut changes = HashMap::new();
+            changes.insert(uri.clone(), vec![text_edit]);
+            let workspace_edit = WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            };
+            let code = match diagnostic.code.clone().unwrap() {
+                NumberOrString::String(s) => s,
+                NumberOrString::Number(n) => n.to_string(),
+            };
+
+            let code_action = CodeActionOrCommand::CodeAction(CodeAction {
+                title: code,
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic.clone()]),
+                edit: Some(workspace_edit),
+                command: None,
+                is_preferred: Some(false),
+                disabled: None,
+                data: None,
+            });
+            response.push(code_action);
+        }
+
+        eprintln!("✅ Mago LSP: return code_action");
+        return Ok(Some(response));
     }
 }
 
