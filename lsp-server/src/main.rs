@@ -1,6 +1,6 @@
 use anyhow::Result;
+use chrono::Utc;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -18,15 +18,9 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use url::Url;
 use uuid::Uuid;
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct InitializationOptions {
-    rulesets: Option<String>,
-}
+const LINT_RULE_URL_BASE: &str = "https://mago.carthage.software/main/en/tools/linter/rules/";
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct MagoSettings {
-    rulesets: Option<String>,
-}
+const MAX_PERMITS: usize = 6;
 
 #[derive(Debug, Clone)]
 struct CompressedDocument {
@@ -45,15 +39,22 @@ struct CachedResults {
 }
 
 #[derive(Debug, Clone)]
+struct CachedConfigPath {
+    config_path: String,
+    timestamp_millis: i64,
+}
+
+#[derive(Debug, Clone)]
 struct MagoLanguageServer {
     client: Client,
     // Compressed document storage to reduce memory usage
     open_docs: std::sync::Arc<std::sync::RwLock<HashMap<Url, CompressedDocument>>>,
     // Cache Mago results to avoid redundant analysis
     results_cache: std::sync::Arc<std::sync::RwLock<HashMap<Url, CachedResults>>>,
+    // Cache Config Path
+    config_cache: std::sync::Arc<std::sync::RwLock<HashMap<Url, CachedConfigPath>>>,
     // Memory tracking
     total_memory_usage: std::sync::Arc<AtomicUsize>,
-    rulesets: std::sync::Arc<std::sync::RwLock<Option<String>>>, // None means use Mago defaults
     mago_path: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     workspace_root: std::sync::Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
     // Limit concurrent Mago processes to prevent system overload
@@ -66,12 +67,12 @@ impl MagoLanguageServer {
             client,
             open_docs: std::sync::Arc::new(std::sync::RwLock::new(HashMap::with_capacity(100))),
             results_cache: std::sync::Arc::new(std::sync::RwLock::new(HashMap::with_capacity(100))),
+            config_cache: std::sync::Arc::new(std::sync::RwLock::new(HashMap::with_capacity(100))),
             total_memory_usage: std::sync::Arc::new(AtomicUsize::new(0)),
-            rulesets: std::sync::Arc::new(std::sync::RwLock::new(None)), // Let Mago use its defaults
             mago_path: std::sync::Arc::new(std::sync::RwLock::new(None)),
             workspace_root: std::sync::Arc::new(std::sync::RwLock::new(None)),
             // Limit to 4 concurrent Mago processes to avoid overwhelming the system
-            process_semaphore: std::sync::Arc::new(Semaphore::new(4)),
+            process_semaphore: std::sync::Arc::new(Semaphore::new(MAX_PERMITS)),
         }
     }
 
@@ -169,7 +170,6 @@ impl MagoLanguageServer {
             }
         }
 
-        //eprintln!("🔍 Mago LSP: Detecting Mago path...");
         eprintln!("🔄 Mago LSP: Using system mago");
         let mago_path = "mago".to_string();
 
@@ -183,49 +183,30 @@ impl MagoLanguageServer {
         mago_path
     }
 
-    fn discover_rulesets(&self, workspace_root: Option<&std::path::Path>) {
-        eprintln!("🔍 Mago LSP: Discovering Mago configuration files...");
+    fn discover_config_file(&self, workspace_root: &std::path::Path) -> Option<String> {
+        let config_files = [
+            "mago.toml",
+            "mago.yaml",
+            "mago.yml",
+            "mago.json",
+            "mago.dist.toml",
+            "mago.dist.yaml",
+            "mago.dist.yml",
+            "mago.dist.json",
+        ];
 
-        if let Some(root) = workspace_root {
-            let config_files = ["mago.toml", "mago.yaml", "mago.json"];
-
-            for config_file in &config_files {
-                let config_path = root.join(config_file);
-
-                if config_path.exists() {
-                    if let Some(path_str) = config_path.to_str() {
-                        eprintln!("✅ Mago LSP: Using config file: {}", config_path.display());
-                        if let Ok(mut rulesets_guard) = self.rulesets.write() {
-                            // Store the full path to the config file
-                            *rulesets_guard = Some(path_str.to_string());
-                        }
-                        return;
-                    } else {
-                        eprintln!("⚠️ Mago LSP: Could not read config file: {}", config_file);
-                    }
+        for config_file in &config_files {
+            let config_path = workspace_root.join(config_file);
+            if config_path.exists() {
+                if let Some(path_str) = config_path.to_str() {
+                    return Some(path_str.to_string());
                 }
             }
-            eprintln!("🔍 Mago LSP: Mago config files found in project root");
         }
+        None
     }
 
-    fn find_project_root(&self, uri: &Url) -> std::path::PathBuf {
-        if let Ok(file_path) = uri.to_file_path() {
-            let mut current = file_path.parent();
-
-            while let Some(dir) = current {
-                // Check for project markers (in order of likelihood)
-                if dir.join("composer.json").exists()
-                    || dir.join("mago.toml").exists()
-                    || dir.join(".git").exists()
-                {
-                    eprintln!("🎯 Mago LSP: Found project root at: {}", dir.display());
-                    return dir.to_path_buf();
-                }
-                current = dir.parent();
-            }
-        }
-
+    fn find_nearest_config_file(&self, uri: &Url) -> Option<String> {
         // Fallback to workspace root or current directory
         let fallback = self
             .workspace_root
@@ -233,11 +214,26 @@ impl MagoLanguageServer {
             .ok()
             .and_then(|g| g.clone())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        eprintln!(
-            "⚠️ Mago LSP: No project markers found, using fallback: {}",
-            fallback.display()
-        );
-        fallback
+
+        if let Ok(file_path) = uri.to_file_path() {
+            let mut current = file_path.parent();
+
+            while let Some(dir) = current {
+                eprintln!("🔍 Mago LSP: Search config at: {}", dir.display());
+                if let Some(config) = self.discover_config_file(dir) {
+                    eprintln!("🎯 Mago LSP: Found config at: {}", config);
+                    return Some(config);
+                }
+
+                if dir.to_path_buf() == fallback {
+                    break;
+                }
+                current = dir.parent();
+            }
+        }
+
+        eprintln!("⚠️ Mago LSP: No condig found, using default");
+        None
     }
 
     async fn run_mago(
@@ -268,35 +264,14 @@ impl MagoLanguageServer {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to acquire process semaphore: {}", e))?;
         eprintln!(
-            "🎫 Mago LSP: Acquired process slot for {} (slots in use: {}/4)",
+            "🎫 Mago LSP: Acquired process slot for {} (slots in use: {}/{})",
             file_name,
-            4 - available_permits
+            MAX_PERMITS - available_permits,
+            MAX_PERMITS
         );
 
         // Use cached Mago path
         let mago_path = self.get_mago_path();
-
-        // Find the project root for this specific file
-        let project_root = self.find_project_root(uri);
-        eprintln!(
-            "📁 Mago LSP: Using project root: {}",
-            project_root.display()
-        );
-
-        // Check if we need to discover config files (if none set or using fallback)
-        let should_discover = if let Ok(rulesets_guard) = self.rulesets.read() {
-            match &*rulesets_guard {
-                None => true,
-                _ => false,
-            }
-        } else {
-            false
-        };
-
-        if should_discover {
-            eprintln!("🔍 Mago LSP: Checking for config files in project root...");
-            self.discover_rulesets(Some(&project_root));
-        }
 
         eprintln!("⚙️ Mago LSP: Using direct execution for: {}", mago_path);
         let mut cmd = ProcessCommand::new(&mago_path);
@@ -305,20 +280,46 @@ impl MagoLanguageServer {
 
         let file = File::open(&temp_file_path).await?.into_std().await;
 
-        // Add config file path after the file path and format
-        if let Ok(rulesets_guard) = self.rulesets.read() {
-            if let Some(ref rulesets) = *rulesets_guard {
-                // Check if this is a path to a config file or ruleset names
-                if rulesets.ends_with(".toml")
-                    || rulesets.ends_with(".yaml")
-                    || rulesets.ends_with(".json")
-                {
-                    eprintln!("📋 Mago LSP: Using config file: {}", rulesets);
-                    cmd.args(&["--config", rulesets]);
-                }
+        let mut config_path: Option<String> = if let Ok(mut guard) = self.config_cache.write() {
+            if let Some(cached_config_path) = guard.get_mut(&uri) {
+                cached_config_path.timestamp_millis = Utc::now().timestamp_millis();
+                Some(cached_config_path.config_path.clone())
             } else {
-                eprintln!("📋 Mago LSP: Using all default rulesets");
+                None
             }
+        } else {
+            None
+        };
+
+        if config_path.is_none() {
+            config_path = self.find_nearest_config_file(uri);
+            if let Some(config_path) = &config_path {
+                if let Ok(mut guard) = self.config_cache.write() {
+                    let cached_config_path = CachedConfigPath {
+                        config_path: config_path.clone(),
+                        timestamp_millis: Utc::now().timestamp_millis(),
+                    };
+                    guard.insert(uri.clone(), cached_config_path);
+                    if guard.len() > 120 {
+                        eprintln!("Mago LSP: config cached trim before len: {}", guard.len());
+                        let mut entries: Vec<(&Url, &CachedConfigPath)> = guard.iter().collect();
+                        entries.sort_by_key(|&(_, value)| value.timestamp_millis);
+                        let top_20_keys: Vec<Url> = entries
+                            .iter()
+                            .take(20)
+                            .map(|&(key, _)| key.clone())
+                            .collect();
+                        for key in top_20_keys {
+                            guard.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(config_file) = config_path {
+            eprintln!("📋 Mago LSP: Using config file: {}", config_file);
+            cmd.args(&["--config", &config_file]);
         }
 
         // Add Mago arguments
@@ -397,13 +398,15 @@ impl MagoLanguageServer {
         drop(_permit);
         let available_after = self.process_semaphore.available_permits();
         eprintln!(
-            "🎫 Mago LSP: Released process slot for {} (slots available: {}/4)",
-            file_name, available_after
+            "🎫 Mago LSP: Released process slot for {} (slots available: {}/{})",
+            file_name, available_after, MAX_PERMITS
         );
 
         // Extract JSON from raw output (Mago might output debug info before JSON)
         let json_output = self.extract_json_from_output(&raw_output);
-        let diagnostics = self.parse_mago_output(&content, &json_output, uri).await?;
+        let diagnostics = self
+            .parse_mago_output(&command, &content, &json_output, uri)
+            .await?;
 
         // Log results with timing
         let total_time = start_time.elapsed();
@@ -499,6 +502,7 @@ impl MagoLanguageServer {
 
     async fn parse_mago_output(
         &self,
+        command: &str,
         content: &String,
         json_output: &str,
         uri: &Url,
@@ -543,7 +547,7 @@ impl MagoLanguageServer {
 
             for (issue_idx, issue_entry) in issues.iter().enumerate() {
                 if let Some(diagnostic) = self
-                    .convert_issue_to_diagnostic(content, issue_entry, uri)
+                    .convert_issue_to_diagnostic(command, content, issue_entry, uri)
                     .await
                 {
                     diagnostics.push(diagnostic);
@@ -574,6 +578,7 @@ impl MagoLanguageServer {
 
     async fn convert_issue_to_diagnostic(
         &self,
+        command: &str,
         content: &String,
         issue: &serde_json::Value,
         uri: &Url,
@@ -647,6 +652,16 @@ impl MagoLanguageServer {
            "edits": issue["edits"],
         });
 
+        let code_description = if command == "lint" {
+            let rule_url = format!("{}#{}", LINT_RULE_URL_BASE, code);
+            match Url::parse(rule_url.as_str()) {
+                Ok(url) => Some(url),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Some(Diagnostic {
             range,
             severity: Some(severity),
@@ -659,7 +674,13 @@ impl MagoLanguageServer {
             message: message.to_string(),
             related_information: None,
             tags: None,
-            code_description: None,
+            code_description: if code_description.is_some() {
+                Some(CodeDescription {
+                    href: code_description.unwrap(),
+                })
+            } else {
+                None
+            },
             data: Some(data),
         })
     }
@@ -691,6 +712,19 @@ impl MagoLanguageServer {
         };
         range
     }
+
+    fn adjust_new_text(&self, content: &String, range: &Range, new_text: &str) -> String {
+        let lines: Vec<&str> = content.split('\n').collect();
+        if lines.len() > (range.end.line + 1) as usize {
+            if new_text.ends_with("\n")
+                && lines[(range.end.line + 1) as usize].is_empty()
+                && lines[range.end.line as usize].len() == range.end.character as usize
+            {
+                return new_text.chars().take(new_text.len() - 1).collect();
+            }
+        }
+        return new_text.to_string();
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -714,64 +748,6 @@ impl LanguageServer for MagoLanguageServer {
         // Store workspace root for Mago path detection
         if let Ok(mut workspace_guard) = self.workspace_root.write() {
             *workspace_guard = workspace_root.clone();
-        }
-
-        let mut should_discover = true;
-
-        if let Some(options) = params.initialization_options {
-            // Parse initialization options
-            eprintln!("📦 Mago LSP: Processing initialization options from extension");
-            match serde_json::from_value::<InitializationOptions>(options.clone()) {
-                Ok(init_options) => {
-                    if let Some(rulesets) = init_options.rulesets {
-                        eprintln!("⚙️ Mago LSP: Extension provided rulesets: '{}'", rulesets);
-                        if let Ok(mut rulesets_guard) = self.rulesets.write() {
-                            *rulesets_guard = Some(rulesets.clone());
-                        }
-                        should_discover = false; // Don't discover if rulesets were explicitly provided
-                    } else {
-                        eprintln!(
-                            "🎯 Mago LSP: No rulesets provided by extension - will discover from workspace"
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("❌ Mago LSP: Failed to parse initialization options: {}", e);
-                }
-            }
-        } else {
-            eprintln!(
-                "📋 Mago LSP: No initialization options provided - will discover from workspace"
-            );
-        }
-
-        // Discover from workspace if no explicit rulesets were provided
-        if should_discover {
-            self.discover_rulesets(workspace_root.as_deref());
-        }
-
-        // Log final initialization state
-        if let Ok(rulesets_guard) = self.rulesets.read() {
-            match &*rulesets_guard {
-                Some(rulesets) => {
-                    if rulesets.ends_with(".toml")
-                        || rulesets.ends_with(".yaml")
-                        || rulesets.ends_with(".json")
-                    {
-                        eprintln!("🎯 Mago LSP: Initialized with config file: '{}'", rulesets);
-                        eprintln!("📋 Mago LSP: Configuration source: Project-specific ruleset");
-                    } else {
-                        eprintln!("🎯 Mago LSP: Initialized with rulesets: '{}'", rulesets);
-                        eprintln!(
-                            "📋 Mago LSP: Configuration source: Custom ruleset configuration"
-                        );
-                    }
-                }
-                None => {
-                    eprintln!("🎯 Mago LSP: Initialized with default rulesets");
-                    eprintln!("📋 Mago LSP: Configuration source: Built-in defaults");
-                }
-            }
         }
 
         eprintln!("✅ Mago LSP: Server initialization complete!");
@@ -826,6 +802,9 @@ impl LanguageServer for MagoLanguageServer {
         if let Ok(mut cache) = self.results_cache.write() {
             cache.clear();
         }
+        if let Ok(mut config) = self.config_cache.write() {
+            config.clear();
+        }
 
         // Reset memory counter
         self.total_memory_usage.store(0, Ordering::Relaxed);
@@ -862,6 +841,16 @@ impl LanguageServer for MagoLanguageServer {
             );
         }
 
+        // Clear cached config
+        if let Ok(mut config) = self.config_cache.write() {
+            let removed = config.remove(&uri);
+            eprintln!(
+                "🗑️ Mago LSP: Config cleared on close for URI: {} - removed: {}",
+                uri,
+                removed.is_some()
+            );
+        }
+
         // Clear diagnostics for closed file
         let _ = self.client.publish_diagnostics(uri, vec![], None).await;
     }
@@ -883,7 +872,7 @@ impl LanguageServer for MagoLanguageServer {
         // This will be done lazily on next Mago run
     }
 
-    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+    async fn did_change_configuration(&self, _params: DidChangeConfigurationParams) {
         eprintln!("🔄 Mago LSP: Configuration change detected!");
 
         // Clear cached Mago path to force re-detection
@@ -892,45 +881,15 @@ impl LanguageServer for MagoLanguageServer {
             eprintln!("🗑️ Mago LSP: Cleared cached Mago path - will re-detect on next use");
         }
 
-        // Parse the settings
-        if let Some(settings) = params.settings.as_object() {
-            // Look for mago settings
-            if let Some(mago_settings) = settings.get("mago") {
-                // Try to parse as MagoSettings
-                if let Ok(parsed_settings) =
-                    serde_json::from_value::<MagoSettings>(mago_settings.clone())
-                {
-                    // Update the rulesets if provided
-                    if let Some(new_rulesets) = parsed_settings.rulesets {
-                        eprintln!(
-                            "⚙️ Mago LSP: Configuration changed via settings: '{}'",
-                            new_rulesets
-                        );
-                        if let Ok(mut rulesets_guard) = self.rulesets.write() {
-                            *rulesets_guard = Some(new_rulesets);
-                        }
-                    }
-                }
-            }
-
-            // Also check for rulesets directly in settings (for compatibility)
-            if let Some(rulesets_value) = settings.get("rulesets") {
-                if let Some(new_rulesets) = rulesets_value.as_str() {
-                    eprintln!(
-                        "⚙️ Mago LSP: Configuration changed via direct rulesets setting: '{}'",
-                        new_rulesets
-                    );
-                    if let Ok(mut rulesets_guard) = self.rulesets.write() {
-                        *rulesets_guard = Some(new_rulesets.to_string());
-                    }
-                }
-            }
-        }
-
         // Clear results cache to force re-analysis with new config
         if let Ok(mut cache) = self.results_cache.write() {
             cache.clear();
             eprintln!("🗑️ Mago LSP: Cleared results cache after config change");
+        }
+
+        if let Ok(mut config) = self.config_cache.write() {
+            config.clear();
+            eprintln!("🗑️ Mago LSP: Cleared config cache after config change");
         }
 
         // Note: Documents will be re-analyzed on next diagnostic() call
@@ -952,13 +911,6 @@ impl LanguageServer for MagoLanguageServer {
             text.len()
         );
 
-        // Debug: Show first few lines of opened file
-        let lines: Vec<&str> = text.lines().collect();
-        eprintln!("📊 Mago LSP: Opened file has {} lines", lines.len());
-        for (i, line) in lines.iter().take(5).enumerate() {
-            eprintln!("  Line {}: {:?}", i + 1, line);
-        }
-
         // Compress and store the document
         let compressed_doc = self.compress_document(&text);
 
@@ -978,6 +930,16 @@ impl LanguageServer for MagoLanguageServer {
             let removed = cache.remove(&uri);
             eprintln!(
                 "🗑️ Mago LSP: Cache invalidated for {} (URI: {}) - removed: {}",
+                file_name,
+                uri,
+                removed.is_some()
+            );
+        }
+
+        if let Ok(mut config) = self.config_cache.write() {
+            let removed = config.remove(&uri);
+            eprintln!(
+                "🗑️ Mago LSP: Config Cache invalidated for {} (URI: {}) - removed: {}",
                 file_name,
                 uri,
                 removed.is_some()
@@ -1208,17 +1170,11 @@ impl LanguageServer for MagoLanguageServer {
                         Ok(content) => {
                             // Log content details to verify we're analyzing the right file
                             eprintln!(
-                                "📄 Mago LSP: Retrieved content for {} (URI: {})",
-                                file_name, uri
+                                "📄 Mago LSP: Retrieved content for {} (URI: {}) - {} bytes",
+                                file_name,
+                                uri,
+                                content.len()
                             );
-                            eprintln!("📄 Mago LSP: Content size: {} bytes", content.len());
-
-                            // Show first few lines to identify which file's content this is
-                            let lines: Vec<&str> = content.lines().collect();
-                            eprintln!("📄 Mago LSP: Content preview (first 5 lines):");
-                            for (i, line) in lines.iter().take(5).enumerate() {
-                                eprintln!("    Line {}: {}", i + 1, line);
-                            }
 
                             content
                         }
@@ -1256,12 +1212,6 @@ impl LanguageServer for MagoLanguageServer {
                     // Debug: Show content details
                     let lines: Vec<&str> = content.lines().collect();
                     eprintln!("📊 Mago LSP: Content has {} lines", lines.len());
-
-                    // Show first 10 lines with line numbers
-                    eprintln!("📝 Mago LSP: First 10 lines of content:");
-                    for (i, line) in lines.iter().take(10).enumerate() {
-                        eprintln!("  Line {}: {:?}", i + 1, line);
-                    }
 
                     // Check for special characters
                     if content.contains('\r') {
@@ -1339,8 +1289,6 @@ impl LanguageServer for MagoLanguageServer {
                         &temp_file_name,
                         &temp_file_path,
                     );
-                    // let lint_handle = tokio::spawn(lint_feature);
-                    // let analyze_handle = tokio::spawn(analyze_feature);
 
                     if let (Ok(lint_diagnostics), Ok(analyze_diagnostics)) =
                         tokio::join!(lint_feature, analyze_feature)
@@ -1481,19 +1429,10 @@ impl LanguageServer for MagoLanguageServer {
                 continue;
             };
             let range = self.calculate_position_to_range(&content, range_start, range_end);
-            // let range = Range {
-            //     start: Position {
-            //         line: 0,
-            //         character: range_start as u32,
-            //     },
-            //     end: Position {
-            //         line: 0,
-            //         character: range_end as u32,
-            //     },
-            // };
+            let adjusted_new_text = self.adjust_new_text(&content, &range, new_text);
             let text_edit = TextEdit {
                 range: range,
-                new_text: new_text.to_string(),
+                new_text: adjusted_new_text,
             };
             let mut changes = HashMap::new();
             changes.insert(uri.clone(), vec![text_edit]);
@@ -1527,6 +1466,22 @@ impl LanguageServer for MagoLanguageServer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args()
+        .map(|s| s.to_lowercase())
+        .any(|arg| arg == "-v" || arg == "--version")
+    {
+        println!("mago-lsp-server v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    } else if std::env::args()
+        .map(|s| s.to_lowercase())
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        println!("Usage: mago-lsp-server [options]");
+        println!("Options:");
+        println!("  -v, --version    Print version information");
+        println!("  -h, --help       Print this help message");
+        return Ok(());
+    }
     let stdin = stdin();
     let stdout = stdout();
 

@@ -80,6 +80,7 @@ impl MagoLspExtension {
 
     fn check_to_update(id: &zed::LanguageServerId) -> Result<String> {
         let (platform, arch) = zed::current_platform();
+
         let release = zed::latest_github_release(
             GITHUB_REPO,
             zed::GithubReleaseOptions {
