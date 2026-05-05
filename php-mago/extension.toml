@@ -1,0 +1,12 @@
+id = "php-mago"
+name = "PHP Mago"
+version = "0.1.0"
+schema_version = 1
+authors = ["Lirim Sakura <sakura@lirim.net>"]
+description = "Language Server for using Mago. Support lint and analyze. Mago is required in your $PATH."
+repository = "https://github.com/LirimSakura/zed-php-mago/tree/main/php-mago"
+
+[language_servers.mago]
+name = "Mago"
+languages = ["PHP"]
+language_ids = { PHP = "php" }

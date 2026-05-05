@@ -1,0 +1,5 @@
+[workspace]
+members = ["lsp-server", "php-mago"]
+
+default-members = ["lsp-server"]
+resolver = "3"
