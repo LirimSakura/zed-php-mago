@@ -6,12 +6,9 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag:
+      tag_name:
         description: "Release tag to build assets for"
         required: true
-
-env:
-  GITHUB_TOKEN: ${{ secrets.OWNER_PAT || secrets.GITHUB_TOKEN }}
 
 jobs:
   build-lsp-server:
@@ -24,31 +21,38 @@ jobs:
             target: x86_64-unknown-linux-gnu
             name: mago-lsp-server-linux-amd64.tar.gz
             arch: x86_64
+            use_cross: false
 
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             name: mago-lsp-server-linux-arm64.tar.gz
             arch: aarch64
+            use_cross: true
 
           - os: macos-latest
             target: x86_64-apple-darwin
             name: mago-lsp-server-darwin-amd64.tar.gz
             arch: x86_64
+            use_cross: false
 
           - os: macos-latest
             target: aarch64-apple-darwin
-            name: mago-lsp-server-macos-arm64.tar.gz
+            name: mago-lsp-server-darwin-arm64.tar.gz
             arch: aarch64
+            use_cross: false
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: mago-lsp-server-windows-amd64.zip
             arch: x86_64
+            use_cross: false
 
           # - os: windows-latest
           #   target: aarch64-pc-windows-msvc
           #   name: mago-lsp-server-windows-arm64.exe
           #   arch: aarch64
+          #   use_cross: false
+
     runs-on: ${{ matrix.os }}
     steps:
       - name: Setup | Checkout
@@ -68,7 +72,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross-compilation tool
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cross Build
+        if: matrix.use_cross
+        run: cross build --manifest-path Cargo.toml --release --target ${{ matrix.target }}
+
       - name: Cargo Build
+        if: ${{ !matrix.use_cross }}
         run: cargo build --manifest-path Cargo.toml --release --target ${{ matrix.target }}
 
       - name: Prepare artifacts [Windows]
@@ -111,6 +124,8 @@ jobs:
     name: Create GitHub Release
     needs: build-lsp-server
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Setup | Checkout
         uses: actions/checkout@v6
@@ -118,7 +133,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup | Artifacts
-        uses: actions/download-artifacts@v8
+        uses: actions/download-artifact@v8
         with:
           path: release-dist
 
@@ -130,4 +145,5 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
           files: release-dist/**/*
