@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build assets for"
+        required: true
+
+env:
+  GITHUB_TOKEN: ${{ secrets.OWNER_PAT || secrets.GITHUB_TOKEN }}
+
+jobs:
+  build-lsp-server:
+    name: Build LSP Server
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: mago-lsp-server-linux-amd64.tar.gz
+            arch: x86_64
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            name: mago-lsp-server-linux-arm64.tar.gz
+            arch: aarch64
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: mago-lsp-server-darwin-amd64.tar.gz
+            arch: x86_64
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: mago-lsp-server-macos-arm64.tar.gz
+            arch: aarch64
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: mago-lsp-server-windows-amd64.zip
+            arch: x86_64
+
+          # - os: windows-latest
+          #   target: aarch64-pc-windows-msvc
+          #   name: mago-lsp-server-windows-arm64.exe
+          #   arch: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup | Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Setup | Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cargo Build
+        run: cargo build --manifest-path Cargo.toml --release --target ${{ matrix.target }}
+
+      - name: Prepare artifacts [Windows]
+        if: matrix.os == 'windows-latest'
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip mago-lsp-server.exe
+          7z a ../../../${{ matrix.name }} mago-lsp-server.exe
+          cd -
+
+      - name: Prepare artifacts [Linux & macOS]
+        if: matrix.os != 'windows-latest'
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip mago-lsp-server || true
+          tar czvf ../../../${{ matrix.name }} mago-lsp-server
+          cd -
+
+      - name: Test Bin [Linux & macOS]
+        if: matrix.arch == 'x86_64' && matrix.os != 'windows-latest'
+        run: |
+          cd target/${{ matrix.target }}/release
+          ./mago-lsp-server --version
+          cd -
+
+      - name: Test Bin [Windows]
+        if: matrix.arch == 'x86_64' && matrix.os == 'windows-latest'
+        run: |
+          cd target/${{ matrix.target }}/release
+          ./mago-lsp-server.exe --version
+          cd -
+
+      - name: Deploy | Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+
+  github-release:
+    name: Create GitHub Release
+    needs: build-lsp-server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup | Artifacts
+        uses: actions/download-artifacts@v8
+        with:
+          path: release-dist
+
+      - name: Setup | Checksums
+        run: |
+          ls -lha release-dist
+          for file in release-dist/**/*; do openssl dgst -sha256 -r "$file" | awk '{print $1}' > "${file}.sha256"; done
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release-dist/**/*
